@@ -1,85 +1,143 @@
 // data entity
 
-use crate::property;
+use crate::property::{self, Value2, KT};
 use crate::transaction;
-use std::collections::HashMap;
+use crate::transaction::EntityChanges;
+//use core::borrow;
+use std::any::{Any, TypeId};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::io;
+use std::io::{Error, ErrorKind, Read, Write};
 use std::mem;
 use std::rc::Rc;
 
-/// Name of an document entity.
-/// Documents may be nested one another; therefore, the name is vector.
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+/// Name of a document entity.
+/// Documents may be nested one another; therefore, the name is a vector.
 /// The name of the removed entity is reserved and will never be used again.
 pub type Name = Vec<u32>; // use SmallVec smallvec::*; or possible store as one number
 
-pub const CHG_CREATED: u32 = 1;
-pub const CHG_DEL_PROP: u32 = 2;
-pub const CHG_UPD_PROP: u32 = 4;
-pub const CHG_ADD_PROP: u32 = 8;
-pub const CHG_DELETED: u32 = 16;
+const CHG_CREATED: u32 = 1;
+const CHG_DEL_PROP: u32 = 2;
+const CHG_UPD_PROP: u32 = 4;
+const CHG_ADD_PROP: u32 = 8;
+const CHG_DELETED: u32 = 16;
 
-/// Minimal entity name
+/// Minimal (and initial) entity name
 pub const START_NAME: u32 = 0;
 
 pub struct Entity {
     /// Full entity name in the document
     pub name: Name,
     /// Properties assigned to this entity
-    pub props: Vec<Rc<property::Value>>,
-    /// Inserted document if any
+    pub props2: Vec<Rc<property::Value2>>,
+    /// If Some() this is inserted document, and it usually stores nested entities
     pub children: Option<Vec<Entity>>,
-
     // Keeps links to this from others
     // links: Vec<(Name, std::rc::Weak<dyn EntityUser>)>,
 }
 
+impl fmt::Debug for property::Value2 {
+    // Required method
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        //let ref b = self.value;
+
+        //let val: dyn Any + 'static = b.borrow();
+
+        write!(f, "  {}: ", self.key)?;
+
+        //        let c = an.downcast_ref::<&dyn std::fmt::Display>();
+
+        let a: &dyn Any = self.value.borrow();
+        let c = a.downcast_ref::<&dyn std::fmt::Display>();
+
+        //        writeln!(f, "{}", c.is_some())?;
+
+        let aa: &dyn Any = &(1, 2) as &dyn Any;
+
+        //let b:  = a.try_into();
+
+        //        if let Some(f) = self.value.downcast_ref::<dyn std::fmt::Display>() {
+        //        }
+
+        //let an: &dyn std::any::Any = self.value.borrow();
+        //writeln!(f, "{:?}", an)?;
+
+        //        (&an as &dyn std::fmt::Debug).fmt(f);
+
+        //let v: &std::fmt::Debug = an.into();
+
+        //let v = an.downcast_ref::<std::fmt::Debug>();
+
+        //let v = self.value.downcast_ref::<&dyn std::fmt::Display>();
+        //writeln!(f, "{}", v.is_some())?;
+
+        if self.value.is::<i32>() {
+            writeln!(f, "{}", self.value.downcast_ref::<i32>().unwrap())?;
+        } else if self.value.is::<&str>() {
+            writeln!(f, "\"{}\"", self.value.downcast_ref::<&str>().unwrap())?;
+        } else {
+            self.value.fmt(f)?;
+            //writeln!(f, " unsupported type!")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Entity {
+    // Required method
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Entity #{}:",
+            self.name
+                .iter()
+                .map(|n| format!("{n}"))
+                .collect::<Vec<String>>()
+                .join(",")
+        )?;
+        for p in &self.props2 {
+            writeln!(f, "  {}", p.key)?;
+        }
+        Ok(())
+    }
+}
+
 impl Entity {
-    pub fn properties(&self) -> PropertyIterator {
-        PropertyIterator {
-            index: 0,
-            properties: &self.props,
+    pub fn get_property<T: Copy + 'static>(&self, key: property::KT) -> Option<T> {
+        if let Some(pos) = self.props2.iter().position(|p| p.key == key) {
+            if let Some(v) = self.props2[pos].value.downcast_ref::<T>() {
+                return Some(v.clone());
+            }
         }
+        None
     }
 
-    pub fn get_property(
-        &self,
-        property_type: &'static property::Value,
-    ) -> Option<&property::Value> {
-        let discr: mem::Discriminant<property::Value> = mem::discriminant(property_type);
-        if let Some(pos) = self
-            .props
-            .iter()
-            .position(|p| mem::discriminant(p.as_ref()) == discr)
-        {
-            Some(self.props[pos].as_ref())
+    pub fn get_property_ptr(&self, key: property::KT) -> Option<Rc<Value2>> {
+        if let Some(pos) = self.props2.iter().position(|p| p.key == key) {
+            Some(self.props2[pos].clone())
         } else {
             None
         }
     }
 
-    pub fn get_property_rc(
-        &self,
-        property_type: &'static property::Value,
-    ) -> Option<Rc<property::Value>> {
-        let discr: mem::Discriminant<property::Value> = mem::discriminant(property_type);
-        if let Some(pos) = self
-            .props
-            .iter()
-            .position(|p| mem::discriminant(p.as_ref()) == discr)
-        {
-            Some(self.props[pos].clone())
-        } else {
-            None
-        }
+    pub fn properties(&self) -> &Vec<Rc<Value2>> {
+        &self.props2
     }
 
-    pub fn get_children_entity(&self, mut name_iter: core::slice::Iter<u32>) -> Option<&Entity> {
+    fn get_child(&self, mut name_iter: core::slice::Iter<u32>) -> Option<&Entity> {
         match name_iter.next() {
             Some(&n) => {
                 match &self.children {
                     None => {}
                     Some(chlds) => {
                         if let Some(pos) = chlds.iter().position(|e| *e.name.last().unwrap() == n) {
-                            return chlds[pos].get_children_entity(name_iter);
+                            return chlds[pos].get_child(name_iter);
                         }
                     }
                 };
@@ -93,27 +151,22 @@ impl Entity {
     fn apply_changes(
         &mut self,
         changes: &transaction::PropChange,
-        storages: &mut Vec<History>,
-    ) -> Result<EnitiyChanges, &'static str> {
+        storages: &mut Vec<TransactionStorage>,
+    ) -> Result<ChangedEntities, &'static str> {
         match changes {
             transaction::PropChange::Update(prop_ptr) => {
-                let prop_discr = mem::discriminant(prop_ptr.as_ref());
-                if let Some(pos) = self
-                    .props
-                    .iter()
-                    .position(|p| mem::discriminant(p.as_ref()) == prop_discr)
-                {
-                    self.props[pos] = prop_ptr.clone();
-                    Ok(EnitiyChanges::from(&self.name, CHG_UPD_PROP))
+                //let prop_discr = mem::discriminant(prop_ptr.as_ref());
+                if let Some(pos) = self.props2.iter().position(|p| p.key == prop_ptr.key) {
+                    self.props2[pos] = prop_ptr.clone();
+                    Ok(ChangedEntities::from(&self.name, CHG_UPD_PROP))
                 } else {
-                    self.props.push(prop_ptr.clone());
-                    let mut entity_changes = EnitiyChanges::from(&self.name, CHG_ADD_PROP);
+                    self.props2.push(prop_ptr.clone());
+                    let mut entity_changes = ChangedEntities::from(&self.name, CHG_ADD_PROP);
 
-                    if prop_discr == mem::discriminant(property::INS_DOC) {
-                        if let &property::Value::InsDoc(doc_id) = prop_ptr.as_ref() {
+                    if prop_ptr.key == property::INS_DOC {
+                        if let Some(doc_id) = prop_ptr.value.downcast_ref::<property::DocId>() {
                             // open inserted document and apply transaction from it to the children of this entity
-
-                            let storage = Document::get_or_open_transactions(storages, doc_id);
+                            let storage = Document::get_or_open_transactions(storages, *doc_id);
                             let mut content: Vec<Entity> = vec![];
                             let united_trs = transaction::Transaction::merge(&storage.htrs);
                             let changes = Document::apply_transaction_private(
@@ -123,47 +176,68 @@ impl Entity {
                             )?;
                             entity_changes.merge(changes);
                             self.children = Some(content);
+                            //}
+                        } else {
+                            return Err("unexpected document id type");
                         }
                     }
                     Ok(entity_changes)
                 }
             }
 
-            transaction::PropChange::Delete(discr) => {
+            transaction::PropChange::Delete(key) => {
                 // removal of a property from an entity
-                if let Some(pos) = self
-                    .props
-                    .iter()
-                    .position(|p| mem::discriminant(p.as_ref()) == *discr)
-                {
-                    self.props.swap_remove(pos);
-                } // ignore the attempt to delete a non-existent property
-                Ok(EnitiyChanges::from(&self.name, CHG_DEL_PROP))
+                if let Some(pos) = self.props2.iter().position(|p| p.key == *key) {
+                    self.props2.swap_remove(pos);
+                } // all attempts to delete a non-existent property are ignored
+                Ok(ChangedEntities::from(&self.name, CHG_DEL_PROP))
             }
+        }
+    }
+
+    fn insert_document() {
+        // TODO
+    }
+}
+
+#[derive(Clone)]
+pub struct PlainEntity {
+    pub props: Vec<Rc<property::Value2>>,
+}
+
+impl PlainEntity {
+    fn new(e: &Entity) -> Self {
+        PlainEntity {
+            props: e.props2.clone(),
         }
     }
 }
 
-/// The objects of an application that uses this library should implement this trait.
-pub trait EntityUser {
-    fn on_change(&mut self, entity: &Entity, flags: u32) -> bool;
-    // ...
-}
+// The objects of an application that uses this library should implement this trait.
+//pub trait EntityUser {
+//    fn on_change(&mut self, entity: &Entity, flags: u32) -> bool;
+//    // ...
+//}
+//
+//pub fn entity_user_factory(_entity: &Entity) -> Option<Rc<dyn EntityUser>> {
+//    // detect required object type by the properties and create it
+//    unimplemented!();
+//}
 
-pub struct EnitiyChanges {
-    // TODO rename, this name already used in crate::transaction::EntityChanges;
+pub struct ChangedEntities {
+    // TODO use transaction::Changes instead
     pub data: HashMap<Name, u32>,
 }
 
-impl EnitiyChanges {
+impl ChangedEntities {
     fn new() -> Self {
-        EnitiyChanges {
+        ChangedEntities {
             data: HashMap::new(),
         }
     }
 
     fn from(name: &Name, flags: u32) -> Self {
-        EnitiyChanges {
+        ChangedEntities {
             data: HashMap::from([(name.clone(), flags)]),
         }
     }
@@ -181,64 +255,61 @@ impl EnitiyChanges {
     }
 }
 
-pub fn entity_user_factory(_entity: &Entity) -> Option<Rc<dyn EntityUser>> {
-    // detect required object type by the properties and create it
-    unimplemented!();
-}
-
 // The history of document changes
-pub struct History {
-    pub id: property::DocId,
-    pub htrs: Vec<transaction::Transaction>,
-    /// How many transaction from `htrs` is applied to document.
-    /// May be less than size of htrs in case of undo.
-    pub applied: usize,
+struct TransactionStorage {
+    id: property::DocId,
+    htrs: Vec<transaction::Transaction>,
+    /// How many transaction from `htrs` is currently applied to document.
+    /// May be less than size of the vector in case of undo.
+    applied: usize,
     /// Latest used name of entity created
-    last_name: u32,
+    last_id: u32,
 }
 
 // The document opened in editor
 pub struct Document {
-    /// Document consist of entities
+    /// Document consist of the entities
     content: Vec<Entity>,
 
-    /// Current active transaction for change this document
-    pub atrs: transaction::Transaction,
+    /// The current active transaction to make changes to this document
+    atrs: transaction::Transaction,
 
     /// History of changes made to this document
-    my: History,
-    other: Vec<History>,
+    my: TransactionStorage,
+
+    /// Cache of all used documents
+    other: Vec<TransactionStorage>,
 }
 
 impl Document {
-    pub fn new(doc_id: property::DocId) -> Self {
+    pub fn new(id: property::DocId) -> Self {
         Document {
             content: vec![],
             atrs: transaction::Transaction {
                 data: vec![],
-                last_name: Some(vec![START_NAME]),
+                last_id: Some(vec![START_NAME]),
             },
-            my: History {
-                id: doc_id,
+            my: TransactionStorage {
+                id,
                 htrs: vec![],
                 applied: 0,
-                last_name: START_NAME,
+                last_id: START_NAME,
             },
-            other: vec![], //transaction::TrStorages::new(),
+            other: vec![],
         }
     }
 
     /// Change current document without destroying object
-    pub fn switch(&mut self, doc_id: property::DocId) -> Result<(), &'static str> {
-        match self.other.iter().position(|h| doc_id == h.id) {
+    pub fn switch(&mut self, id: property::DocId) -> Result<(), &'static str> {
+        match self.other.iter().position(|h| id == h.id) {
             None => {
                 self.other.push(mem::replace(
                     &mut self.my,
-                    History {
-                        id: doc_id,
+                    TransactionStorage {
+                        id,
                         htrs: vec![],
                         applied: 0,
-                        last_name: START_NAME,
+                        last_id: START_NAME,
                     },
                 ));
             }
@@ -250,13 +321,21 @@ impl Document {
 
         self.undo(0)?;
 
-        self.atrs.last_name = Some(vec![self.my.last_name]);
+        self.atrs.last_id = Some(vec![self.my.last_id]);
 
         Ok(())
     }
 
+    pub fn entities(&self, with_children: bool) -> EntityIterator {
+        EntityIterator {
+            index: vec![0],
+            with_children,
+            entities: &self.content,
+        }
+    }
+
     /// Find entity of (this or inserted) document
-    pub fn get_entity(&self, name: &crate::entity::Name) -> Option<&Entity> {
+    pub fn get_entity(&self, name: Name) -> Option<&Entity> {
         let mut name_iter = name.iter();
         if let Some(&top_name) = name_iter.next() {
             if let Some(top_index) = self
@@ -264,15 +343,58 @@ impl Document {
                 .iter()
                 .position(|e| *e.name.last().unwrap() == top_name)
             {
-                return self.content[top_index].get_children_entity(name_iter);
+                return self.content[top_index].get_child(name_iter);
             }
         }
         None
     }
 
-    /// Get current active transaction to make a changes in the document
-    pub fn trs(&mut self) -> &mut transaction::Transaction {
-        &mut self.atrs
+    /// This convenient method is useful if all you need to do is read a property
+    pub fn get_property<T: Copy + 'static>(&self, entity_name: Name, key: KT) -> Option<T> {
+        if let Some(entity) = self.get_entity(entity_name) {
+            entity.get_property::<T>(key)
+        } else {
+            None
+        }
+    }
+
+    pub fn create_entity(&mut self) -> &mut EntityChanges {
+        self.atrs.create_entity()
+    }
+
+    pub fn update_entity(&mut self, name: Name) -> &mut EntityChanges {
+        self.atrs.update_entity(name)
+    }
+
+    pub fn delete_entity(&mut self, name: Name) {
+        self.atrs.delete_entity(name)
+    }
+
+    /// Create and return copy of all the entities by its names.
+    /// To make "cut" command, the entities must be deleted just after copying.
+    pub fn copy(&self, names: BTreeSet<Name>) -> Vec<PlainEntity> {
+        // TODO if copied two entity and the first has link to the second, the link should be updated
+        self.entities(true)
+            .filter_map(|e| {
+                if names.contains(&e.name) {
+                    Some(PlainEntity::new(e))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Create in the document copies of entities previously copied with Document::copy.
+    /// The document own all the created entity, even if it was taken from any inserted document.
+    pub fn paste(&mut self, ref clipboard: Vec<PlainEntity>) {
+        let ref mut trs = self.atrs;
+        for entity in clipboard {
+            let changes = trs.create_entity();
+            for prop in &entity.props {
+                changes.copy(prop.clone());
+            }
+        }
     }
 
     pub fn history_size(&self) -> (usize, usize) {
@@ -302,49 +424,43 @@ impl Document {
         Ok(())
     }
 
-    /// Applying without commit allowed only for transactions of limited types
-    pub fn apply_transaction<'a>(
-        &mut self,
-        //and_commit: bool,
-    ) -> Result<EnitiyChanges, &'static str> {
-        let entity_changes =
-            Document::apply_transaction_private(&self.atrs, &mut self.content, &mut self.other)?;
+    /// Apply all the modifications accumulated in the active transaction to the document and start a new transaction.
+    pub fn commit_transaction(&mut self) -> Result<ChangedEntities, &'static str> {
+        let changes = self.apply_transaction()?;
 
-        // TODO apply transaction partially for each occurence of Changes::Closed
-        let mut and_commit = false;
-        for d in &self.atrs.data {
-            if let crate::transaction::Changes::Closed = *d {
-                and_commit = true;
-                break;
+        // save back to document last used entity name
+        if let Some(trs_last_id) = &self.atrs.last_id {
+            if let Some(id) = trs_last_id.last() {
+                self.my.last_id = *id;
             }
         }
 
-        if and_commit {
-            if let Some(trs_last_name) = &self.atrs.last_name {
-                self.my.last_name = *trs_last_name.last().unwrap();
+        // archive the finished transaction and create new
+        let finished = mem::replace(
+            &mut self.atrs,
+            transaction::Transaction {
+                data: vec![],
+                last_id: Some(vec![self.my.last_id]),
+            },
+        );
+        self.my.htrs.truncate(self.my.applied);
+        self.my.htrs.push(finished);
+        self.my.applied = self.my.htrs.len();
 
-                // move the transaction to the history
-                let oldtrs = mem::replace(
-                    &mut self.atrs,
-                    transaction::Transaction {
-                        data: vec![],
-                        last_name: Some(vec![self.my.last_name]),
-                    },
-                );
-                self.my.htrs.truncate(self.my.applied);
-                self.my.htrs.push(oldtrs);
-                self.my.applied = self.my.htrs.len();
-            }
-        }
-        Ok(entity_changes)
+        Ok(changes)
     }
 
-    fn apply_transaction_private<'a>(
+    /// Applying without committing is only permitted for specific kinds of modifications
+    pub fn apply_transaction(&mut self) -> Result<ChangedEntities, &'static str> {
+        Document::apply_transaction_private(&self.atrs, &mut self.content, &mut self.other)
+    }
+
+    fn apply_transaction_private(
         trs: &transaction::Transaction,
         content: &mut Vec<Entity>,
-        inserted_storages: &mut Vec<History>,
-    ) -> Result<EnitiyChanges, &'static str> {
-        let mut entity_changes = EnitiyChanges::new();
+        inserted_storages: &mut Vec<TransactionStorage>,
+    ) -> Result<ChangedEntities, &'static str> {
+        let mut entity_changes = ChangedEntities::new();
         for item in &trs.data {
             match &item {
                 transaction::Changes::Update(changes) => {
@@ -369,23 +485,22 @@ impl Document {
                     }
                     return Err("no suitable object was found");
                 }
-                transaction::Changes::Closed => {}
             }
         }
         Ok(entity_changes)
     }
 
-    fn get_or_open_transactions<'x>(
-        history: &'x mut Vec<History>,
-        doc_id: property::DocId,
-    ) -> &'x History {
-        match history.iter().position(|h| doc_id == h.id) {
+    fn get_or_open_transactions<'y>(
+        history: &'y mut Vec<TransactionStorage>,
+        id: property::DocId,
+    ) -> &'y TransactionStorage {
+        match history.iter().position(|h| id == h.id) {
             None => {
-                history.push(History {
-                    id: doc_id,
+                history.push(TransactionStorage {
+                    id,
                     htrs: vec![],
                     applied: 0,
-                    last_name: START_NAME,
+                    last_id: START_NAME,
                 });
                 &history.last().unwrap()
             }
@@ -398,8 +513,8 @@ impl Document {
         mut ename: std::slice::Iter<u32>,
         props: &Vec<transaction::PropChange>,
         content: &mut Vec<Entity>,
-        storages: &mut Vec<History>,
-    ) -> Result<EnitiyChanges, &'static str> {
+        storages: &mut Vec<TransactionStorage>,
+    ) -> Result<ChangedEntities, &'static str> {
         if ename.len() > 1 {
             // for nested entity call this method recursively
             let &last_name = ename.next().unwrap();
@@ -425,12 +540,12 @@ impl Document {
                 }
             }
 
-            let mut entity_changes = EnitiyChanges::new();
+            let mut entity_changes = ChangedEntities::new();
             if object.is_none() {
                 // entity with specified name isn't found, create new
                 content.push(Entity {
                     name: vec![last_name],
-                    props: vec![],
+                    props2: vec![],
                     children: None,
                     //links: vec![],
                 });
@@ -454,42 +569,83 @@ impl Document {
 
         Err("no suitable object was found")
     }
-
-    pub fn entities(&self) -> EntityIterator {
-        EntityIterator {
-            index: 0,
-            entities: &self.content,
-        }
-    }
 }
 
 pub struct EntityIterator<'a> {
-    index: usize,
+    index: Vec<usize>,
+    with_children: bool,
     entities: &'a Vec<Entity>,
+}
+
+impl<'a> EntityIterator<'a> {
+    fn get_entity(&self, mut indexes: std::slice::Iter<usize>) -> Option<&'a Entity> {
+        if let Some(&first_pos) = indexes.next() {
+            if self.entities.len() > first_pos {
+                let mut res = &self.entities[first_pos];
+
+                for &pos in indexes {
+                    if let Some(chlds) = &res.children {
+                        if let Some(entity) = chlds.get(pos) {
+                            res = entity;
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                return Some(res);
+            }
+        }
+        return None;
+    }
 }
 
 impl<'a> Iterator for EntityIterator<'a> {
     type Item = &'a Entity;
 
     fn next(&mut self) -> Option<&'a Entity> {
-        if self.index < self.entities.len() {
-            self.index += 1;
-            Some(&self.entities[self.index - 1])
+        let mut res = self.get_entity(self.index.iter());
+
+        // increment index
+        if res.is_some() {
+            if self.with_children && res.unwrap().children.is_some() {
+                self.index.push(0);
+            } else {
+                *self.index.last_mut().unwrap() += 1;
+            }
         } else {
-            None
+            // if none found, go to the parent's entities
+            while res.is_none() {
+                self.index.pop();
+                if !self.index.is_empty() {
+                    *self.index.last_mut().unwrap() += 1;
+                    res = self.get_entity(self.index.iter());
+
+                    if res.is_some() {
+                        if res.unwrap().children.is_some() {
+                            self.index.push(0);
+                        } else {
+                            *self.index.last_mut().unwrap() += 1;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
         }
+
+        return res;
     }
 }
 
 pub struct PropertyIterator<'a> {
     index: usize,
-    properties: &'a Vec<Rc<property::Value>>,
+    properties: &'a Vec<Rc<property::Value2>>,
 }
 
 impl<'a> Iterator for PropertyIterator<'a> {
-    type Item = &'a property::Value;
+    type Item = &'a property::Value2;
 
-    fn next(&mut self) -> Option<&'a property::Value> {
+    fn next(&mut self) -> Option<&'a property::Value2> {
         if self.index < self.properties.len() {
             self.index += 1;
             Some(&self.properties[self.index - 1])
@@ -497,4 +653,25 @@ impl<'a> Iterator for PropertyIterator<'a> {
             None
         }
     }
+}
+
+#[test]
+fn trs_len_grow() {
+    let mut doc = crate::entity::Document::new(1);
+
+    const KEY1: property::KT = 0;
+    const KEY2: property::KT = 0;
+
+    let l0 = doc.atrs.len();
+    doc.create_entity().add(KEY1, 101);
+    let l1 = doc.atrs.len();
+    assert!(l0 < l1);
+
+    doc.create_entity().add(KEY1, 101).add(KEY2, "qwerty");
+    let l2 = doc.atrs.len();
+    assert!(l1 < l2);
+    assert!(l1 - l0 < l2 - l1);
+
+    //doc.trs().close();
+    //assert_eq!(doc.trs().len(), l2);
 }
